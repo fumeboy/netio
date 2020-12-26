@@ -1,71 +1,44 @@
-// +build linux
-
 package netio
 
 import (
-	"net"
 	"sync"
 	"syscall"
 	"unsafe"
 )
 
-// _EPOLLET value is incorrect in syscall
 const (
-	_EPOLLET      = 0x80000000
-	_EFD_NONBLOCK = 0x800
+	maxEvents = 1024
+
+	EPOLLET_ = 0x80000000
+	// syscall.EPOLLET 的值是 -0x80000000，应该是错误的， 很奇怪
+	// ET 边缘触发
 )
 
-type poller struct {
-	mu     sync.Mutex // mutex to protect fd closing
-	pfd    int        // epoll fd
-	efd    int        // eventfd
-	efdbuf []byte
+var globalEpoll epoll
 
-	// awaiting for poll
-	awaiting      []int
-	awaitingMutex sync.Mutex
+type epoll struct {
+	fd                     int
+	wakeUpEventFd          int
+	wakeUpEventFdSignalOut []byte
 
-	// closing signal
-	die     chan struct{}
-	dieOnce sync.Once
+	toAdd      []int // 可以考虑改成 chan
+	toAddMutex sync.Mutex
+
+	closeChan  chan struct{}
+	closeOnce  sync.Once
+	finishChan chan struct{}
 }
 
-// dupconn use RawConn to dup() file descriptor
-func dupconn(conn net.Conn) (newfd int, err error) {
-	sc, ok := conn.(interface {
-		SyscallConn() (syscall.RawConn, error)
-	})
-	if !ok {
-		return -1, ErrUnsupported
-	}
-	rc, err := sc.SyscallConn()
-	if err != nil {
-		return -1, ErrUnsupported
-	}
-
-	// Control() guarantees the integrity of file descriptor
-	ec := rc.Control(func(fd uintptr) {
-		newfd, err = syscall.Dup(int(fd))
-	})
-
-	if ec != nil {
-		return -1, ec
-	}
-
-	return
-}
-
-func openPoll() (*poller, error) {
+func (p *epoll) init() error {
 	fd, err := syscall.EpollCreate1(syscall.EPOLL_CLOEXEC)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	r0, _, e0 := syscall.Syscall(syscall.SYS_EVENTFD2, 0, _EFD_NONBLOCK, 0)
+	r0, _, e0 := syscall.Syscall(syscall.SYS_EVENTFD2, 0, 0, 0) // 调用 eventfd 函数
 	if e0 != 0 {
 		syscall.Close(fd)
-		return nil, err
+		return err
 	}
-
 	if err := syscall.EpollCtl(fd, syscall.EPOLL_CTL_ADD, int(r0),
 		&syscall.EpollEvent{Fd: int32(r0),
 			Events: syscall.EPOLLIN,
@@ -73,108 +46,95 @@ func openPoll() (*poller, error) {
 	); err != nil {
 		syscall.Close(fd)
 		syscall.Close(int(r0))
-		return nil, err
+		return err
 	}
-
-	p := new(poller)
-	p.pfd = fd
-	p.efd = int(r0)
-	p.efdbuf = make([]byte, 8)
-	p.die = make(chan struct{})
-
-	return p, err
+	p.fd = fd
+	p.wakeUpEventFd = int(r0)
+	p.wakeUpEventFdSignalOut = make([]byte, 8)
+	p.closeChan = make(chan struct{})
+	p.finishChan = make(chan struct{})
+	return err
 }
 
-// Close the poller
-func (p *poller) Close() error {
-	p.dieOnce.Do(func() {
-		close(p.die)
+func (p *epoll) add(fd int) error {
+	p.toAddMutex.Lock()
+	p.toAdd = append(p.toAdd, fd)
+	p.toAddMutex.Unlock()
+
+	return p.wakeup() // 使用 wakeup 使 epoll wait 结束阻塞
+}
+
+func (p *epoll) del(fd int) error {
+	return syscall.EpollCtl(p.fd, syscall.EPOLL_CTL_DEL, fd, nil)
+}
+
+func (p *epoll) close() error {
+	p.closeOnce.Do(func() {
+		close(p.closeChan)
 	})
 	return p.wakeup()
 }
 
-func (p *poller) watch(fd int) error {
-	p.awaitingMutex.Lock()
-	p.awaiting = append(p.awaiting, fd)
-	p.awaitingMutex.Unlock()
-
-	return p.wakeup()
+func (p *epoll) wakeup() error {
+	var x uint64 = 1 // 非 0 值
+	_, err := syscall.Write(p.wakeUpEventFd, (*(*[8]byte)(unsafe.Pointer(&x)))[:])
+	return err
 }
 
-// wakeup interrupt epoll_wait
-func (p *poller) wakeup() error {
-	p.mu.Lock()
-	if p.efd != -1 {
-		var x uint64 = 1
-		// eventfd has set with EFD_NONBLOCK
-		_, err := syscall.Write(p.efd, (*(*[8]byte)(unsafe.Pointer(&x)))[:])
-		p.mu.Unlock()
-		return err
-	}
-	p.mu.Unlock()
-	return ErrPollerClosed
-}
-
-func (this *Server) wait() {
-	p := this.poller
-	events := make([]syscall.EpollEvent, maxEvents)
-	// close poller fd & eventfd in defer
+func (p *epoll) run() {
 	defer func() {
-		p.mu.Lock()
-		syscall.Close(p.pfd)
-		syscall.Close(p.efd)
-		p.pfd = -1
-		p.efd = -1
-		p.mu.Unlock()
+		syscall.Close(p.fd)
+		syscall.Close(p.wakeUpEventFd)
+		p.fd = -1
+		p.wakeUpEventFd = -1
+		p.finishChan <- struct{}{}
 	}()
-
-	// epoll eventloop
+	events := make([]syscall.EpollEvent, maxEvents)
 	for {
 		select {
-		case <-p.die:
+		case <-p.closeChan:
 			return
 		default:
-			// check for new awaiting
-			p.awaitingMutex.Lock()
-			for _, fd := range p.awaiting {
-				syscall.EpollCtl(p.pfd, syscall.EPOLL_CTL_ADD, int(fd), &syscall.EpollEvent{Fd: int32(fd), Events: syscall.EPOLLRDHUP | syscall.EPOLLIN | syscall.EPOLLOUT | _EPOLLET})
+			p.toAddMutex.Lock()
+			for _, fd := range p.toAdd {
+				syscall.EpollCtl(p.fd, syscall.EPOLL_CTL_ADD, int(fd), &syscall.EpollEvent{Fd: int32(fd), Events: syscall.EPOLLRDHUP | syscall.EPOLLIN | syscall.EPOLLOUT | EPOLLET_})
 			}
-			p.awaiting = p.awaiting[:0]
-			p.awaitingMutex.Unlock()
+			p.toAdd = p.toAdd[:0]
+			p.toAddMutex.Unlock()
 
-			n, err := syscall.EpollWait(p.pfd, events, -1)
+			n, err := syscall.EpollWait(p.fd, events, -1)
 			if err == syscall.EINTR {
 				continue
 			}
 			if err != nil {
 				return
 			}
-
-			// event processing
-			var pe []event
 			for i := 0; i < n; i++ {
 				ev := &events[i]
-				if int(ev.Fd) == p.efd {
-					syscall.Read(p.efd, p.efdbuf) // simply consume
-				} else {
-					e := event{ident: int(ev.Fd)}
-
-					// EPOLLRDHUP (since Linux 2.6.17)
-					// Stream socket peer closed connection, or shut down writing
-					// half of connection.  (This flag is especially useful for writ-
-					// ing simple code to detect peer shutdown when using Edge Trig-
-					// gered monitoring.)
-					if ev.Events&(syscall.EPOLLIN|syscall.EPOLLERR|syscall.EPOLLHUP|syscall.EPOLLRDHUP) != 0 {
-						e.r = true
+				if int(ev.Fd) == p.wakeUpEventFd {
+					syscall.Read(p.wakeUpEventFd, p.wakeUpEventFdSignalOut)
+				} else if c, ok := globalServer.connections[int(ev.Fd)]; ok {
+					/*
+						EPOLLIN ：表示对应的文件描述符可以读（包括对端SOCKET正常关闭）；
+						EPOLLOUT：表示对应的文件描述符可以写；
+						EPOLLPRI：表示对应的文件描述符有紧急的数据可读（这里应该表示有带外数据到来）；
+						EPOLLERR：表示对应的文件描述符发生错误；
+						EPOLLHUP：表示对应的文件描述符被挂断；
+						EPOLLET： 将EPOLL设为边缘触发(Edge Triggered)模式，这是相对于水平触发(Level Triggered)来说的。
+						EPOLLONESHOT：只监听一次事件，当监听完这次事件之后，如果还需要继续监听这个socket的话，需要再次把这个socket加入到EPOLL队列里
+					*/
+					if ((events[i].Events & syscall.EPOLLHUP) != 0) && ((events[i].Events & syscall.EPOLLIN) == 0) {
+						c.close()
+						continue
 					}
-					if ev.Events&(syscall.EPOLLOUT|syscall.EPOLLERR|syscall.EPOLLHUP) != 0 {
-						e.w = true
+					if events[i].Events&(syscall.EPOLLIN|syscall.EPOLLPRI|syscall.EPOLLRDHUP) != 0 {
+						c.read()
 					}
-
-					pe = append(pe, e)
+					if (events[i].Events&syscall.EPOLLERR != 0) || (events[i].Events&syscall.EPOLLOUT != 0) {
+						c.write()
+					}
 				}
 			}
-			this.handle_events(pe)
 		}
 	}
 }
